@@ -1,0 +1,136 @@
+#include <simdjson.h>
+#include <iostream>
+#include <fstream>
+#include <filesystem>
+#include <set>
+#include <map>
+
+
+class FileManager {
+public:
+    FileManager(const std::string& module, const std::string& dir, const std::set<std::string >& includes):
+        module_ { module },
+        output_dir_ { dir },
+        includes_{ includes } {
+
+    }
+
+    ~FileManager() {
+        for (const auto& [header, info] : created_files_) {
+            auto file = fileForHeader(header);
+            for (const auto& generator : generators_) {
+                file << "template<>\nvoid genome::Inspector::registerModule<" << generator << ", \"" << module_ << "\"_module>() {\n";
+                for (const auto& class_name : info) {
+                    file << "\tregisterFunction<" << class_name << ", " << generator << ">();\n";
+                }
+                file << "}\n";
+            }
+        }
+    }
+
+    std::string generatedFileName(const std::string& header_name) const {
+        std::filesystem::path path{ header_name };
+        path = path.replace_extension("cpp");
+        return output_dir_ + "/" + path.filename().string();
+    }
+
+    std::ofstream fileForHeader(const std::string& include_dir) {
+        const auto file_name = generatedFileName(include_dir);
+        std::cout << "file_name  = [" << file_name << "]" << std::endl;
+        std::ofstream file;
+        file.open(file_name, wasInit(include_dir) ? std::ios_base::app : std::ios_base::out);
+        if (!file) {
+            std::exit(1);
+        }
+        initFile(include_dir, file);
+        return std::move(file);
+    }
+
+    void addGenerator(const std::string& generator) {
+        generators_.emplace(generator);
+    }
+    void addClass(const std::string& header, const std::string& class_name) {
+        created_files_[header].emplace(class_name);
+    }
+private:
+    bool wasInit(const std::string& header_name) const noexcept {
+        return created_files_.find(header_name) != created_files_.end();
+    }
+
+    void initFile(const std::string& include_dir, std::ofstream& file) {
+        if (wasInit(include_dir)) {
+            return;
+        }
+        created_files_.emplace(include_dir, FileInfo{});
+        file << "#include <" << include_dir << ">" << std::endl;
+        file << "#include <utils/component_user_data.hpp>" << std::endl;
+        for (const auto& inc : includes_) {
+            file << "#include <" << inc << ">" << std::endl;
+        }
+        file << std::endl;
+
+    }
+    using FileInfo = std::set<std::string>;
+    std::string module_;
+    std::string output_dir_;
+    std::map<std::string, FileInfo> created_files_;
+    std::set<std::string > includes_;
+    std::set<std::string > generators_;
+};
+
+void process_class(FileManager& file_manager, const std::string& generator, const simdjson::dom::element& info) {
+    const auto class_name = std::string(info["name"]);
+    const auto header = std::string(info["include_dir"]);
+    auto out = file_manager.fileForHeader(header);
+    file_manager.addGenerator(generator);
+    file_manager.addClass(header, class_name);
+    out << "template<>\nvoid genome::Inspector::run(const " << class_name << "& object, " << generator << "& generator) {" << std::endl;
+
+
+    for (auto field : info["fields"]) {
+        auto field_name = field["name"];
+        out << "\tgenerator.process(" << field_name << ", object." << field_name.get_string() << ");" << std::endl;
+    }
+    out << "}\n" << std::endl;
+}
+
+
+int main(int argc, const char** argv) {
+    if (argc < 4) {
+        std::cerr << "Invalid argument count" << std::endl;
+        std::exit(1);
+    }
+
+    const std::string input_file_name = argv[1];
+    const std::string output_directory = argv[2];
+    const std::string config_file = argv[3];
+
+    simdjson::dom::parser parser;
+    simdjson::dom::parser config_parser;
+    std::cout << "Loading [" << input_file_name << "]" << std::endl;
+    auto document = parser.load(input_file_name);
+    if (document.error() != simdjson::error_code::SUCCESS) {
+        return 1;
+    }
+
+    auto config = config_parser.load(config_file);
+    if (config.error() != simdjson::error_code::SUCCESS) {
+        return 1;
+    }
+
+    std::set<std::string> headers;
+    std::set<std::string> generators;
+    for (auto header : config["headers"]) {
+        headers.insert(std::string(header));
+    }
+
+    auto classes = document["classes"];
+    FileManager file_manager {std::string(document["module"]), output_directory, headers };
+    for (auto generator : config["generators"]) {
+        for (auto class_to_reflect : classes) {
+            process_class(file_manager, std::string(generator), class_to_reflect);
+        }
+    }
+
+    return 0;
+}
